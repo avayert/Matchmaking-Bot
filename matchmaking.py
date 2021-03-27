@@ -44,6 +44,8 @@ DEFAULT_MATCHMAKING_EXPIRATION = 30
 
 DATABASE_NAME = "/opt/matchmaking/data.db"
 
+BANLIST = ["table", "tables", "drop", "insert", "insert", ";", "\\"]
+
 CREATE_TABLE_MATCH = """CREATE TABLE match (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, game VARCHAR(100) NOT NULL, expiration INT NOT NULL, platform VARCHAR(5) DEFAULT "pc", server_id INTEGER NOT NULL, timestamp INTEGER);"""
     # id = match[0]
     # channel_id = match[1]
@@ -68,6 +70,26 @@ CREATE_TABLE_USER = """CREATE TABLE user ( id INTEGER PRIMARY KEY AUTOINCREMENT,
 #CREATE_TABLE_GAME = """CREATE TABLE game ( id INTEGER PRIMARY KEY AUTOINCREMENT, name VARCHAR(100))"""
     # id = game[0]
     # name = game[1]
+CREATE_TABLE_ALIAS = """CREATE TABLE alias (server_id INTEGER, name VARCHAR(100), other_name VARCHAR(100))"""
+    # server_id = id of the server for the alias
+    # name = abbreviation of a game
+    # other_name = abbreviation of a game with a fullname
+CREATE_TABLE_FULLNAME = """CREATE TABLE fullname (server_id INTEGER, name VARCHAR(100), other_name VARCHAR(100))"""
+    # server_id = id of the server for the full name
+    # name = abbreviation of a game
+    # other_name = full name of a game
+CREATE_TABLE_PINGHOST = """CREATE TABLE pinghost (server_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, listname VARCHAR(100) UNIQUE)"""
+    # server_id = id of the server for the pinglist
+    # discord_id = id of the user who can ping the listers
+    # listname = the name of the list
+CREATE_TABLE_PINGSUB = """CREATE TABLE pingsub (server_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, listname VARCHAR(100))"""
+    # server_id = id of the server for the pinglist
+    # discord_id = id of the user who has subscribed to a pinglist
+    # listname = the name of the subscribed list
+CREATE_TABLE_BOARD = """CREATE TABLE board (server_id INTEGER NOT NULL, channel_id INTEGER NOT NULL, message_id INTEGER)"""
+    # server_id = id of the server for the matchboard
+    # channel_id = the channel where the bot posts the active matches
+    # message_id = the id of the last message the bot posted on the board
 
 PLATFORM_PC = "pc"
 PLATFORM_PSN = "psn"
@@ -112,7 +134,7 @@ async def on_message(message : discord.Message):
     msg = message.content
     if msg.startswith(",m"):
         await message.add_reaction("<:muikea:296390386547556352>")
-    elif msg.startswith('.steamid') or msg.startswith(".lobby") or msg.startswith(".m"):
+    elif msg.startswith('.steamid') or msg.startswith(".lobby") or msg.startswith(".m") or msg.startswith(".fullname") or msg.startswith(".alias") or msg.startswith(".d") or msg.startswith(".p") or msg.startswith(".board"):
         # We do not want the bot to reply to itself
         if message.author == client.user:
             return
@@ -122,8 +144,13 @@ async def on_message(message : discord.Message):
         # For debug, ignore calls from super admin
         if COUNTER_DEBUG and message.author.id == SUPER_ADMIN_ID:
             return
-        dprint("------------------------------------------------ channel_id:" + str(message.channel.id))
+        dprint("------------------------------------------------  channel_id:" + str(message.channel.id))
 
+        admin = message.author.id == SUPER_ADMIN_ID
+        directMessage = isinstance(message.channel, discord.channel.DMChannel)
+        if not directMessage: #message.author.guild_permissions seems to cause an error in dms
+            admin = admin or message.author.guild_permissions.manage_channels
+                    
         conn = sqlite3.connect(DATABASE_NAME) # create connection
         if msg.startswith('.steamid'):
             dprint(".steamid ; " + message.author.name + "-" + str(message.author.id))
@@ -135,10 +162,298 @@ async def on_message(message : discord.Message):
             await cmd_list(message, conn)
         elif msg.startswith('.mc') or msg.startswith('.m clear'):
             await cmd_clearall(message, conn)
-        elif msg.startswith('.m') and message.channel.id != BOT_PM_CHANNEL:
+        elif msg.startswith('.m') and not directMessage:
             dprint(".m ; " + message.author.name + "-" + str(message.author.id))
             await cmd_matchmake(message, conn)
+        elif msg.startswith('.pc') and not directMessage:
+            dprint(".pc ; " + message.author.name + "-" + str(message.author.id))
+            await cmd_pinglistclear(message, conn, admin)
+        elif msg.startswith('.p') and not directMessage:
+            dprint(".p ; " + message.author.name + "-" + str(message.author.id))
+            await cmd_pinglist(message, conn)
+        elif admin and not directMessage:
+            if msg.startswith('.fullname'):
+                await cmd_fullname(message, conn)
+            elif msg.startswith('.alias'):
+                await cmd_alias(message, conn)
+            elif msg.startswith('.d'):
+                await cmd_default(message, conn)
+            elif msg.startswith('.board'):
+                await cmd_board(message, conn)
         conn.close()
+#end
+
+async def cmd_fullname(message : discord.Message, conn):
+    content = (' '.join(message.content.split())).split(" ")
+    args = content[1:len(content)]
+    if len(args) is None or len(args) == 0:
+        await message.channel.send(".fullname <SHORT NAME> (abbreviation of the name of the game, without spaces) <FULL NAME> (Full name of the game, can include spaces)")
+        return
+    if args[0].isdigit():
+        await message.channel.send("The abbreviation can't be a digit.")
+        return
+    for i in range(len(args)):
+        if checkBan(args[i].lower()):
+            return
+    
+    #Check if the game has a fullname
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM fullname WHERE name = ? AND server_id = ?", (args[0].lower(), message.channel.guild.id,))
+    game = cur.fetchone()
+    shortname = ""
+    fullname = ""
+    
+    if len(args) == 1:
+        #If only one argument, delete full name if found
+        if game is not None:
+            cur.execute("DELETE FROM fullname WHERE name = ? AND server_id = ?;", (args[0].lower(), message.channel.guild.id,))
+            cur.execute("DELETE FROM alias WHERE other_name = ? AND server_id = ?;", (args[0].lower(), message.channel.guild.id,))
+            conn.commit()
+            await message.channel.send("Deleted the full name for the game \"" + args[0] +"\".")
+            return
+        else:
+            await message.channel.send("No fullname for the game \"" + args[0] +"\".")
+        return
+    else:
+        shortname = args[0]
+        del args[0]
+        fullname = ' '.join(args)
+        if game is not None:
+            #Update instead of inserting if game has a full name already
+            cur.execute("UPDATE fullname SET other_name = ? WHERE name = ? AND server_id = ?;", (fullname, shortname.lower(), message.channel.guild.id,))
+        else:
+            cur.execute("INSERT INTO fullname (name, other_name, server_id) VALUES (?, ?, ?);", (shortname.lower(), fullname, message.channel.guild.id,))
+        
+    conn.commit()
+    await message.channel.send("Set the full name of \"" + shortname +"\" as \"" + fullname +"\".")
+#end
+
+async def cmd_alias(message : discord.Message, conn):
+    content = (' '.join(message.content.split())).split(" ")
+    args = content[1:len(content)]
+    
+    if len(args) is None or len(args) == 0:
+        await message.channel.send(".alias <SHORT NAME>... <SHORT NAME> (abbreviation of the name of the game, without spaces)| One of the short names has to have a full name")
+        return
+        
+    cur = conn.cursor()
+    fullnameIndex = -1
+    toDelete = []
+    
+    for i in range(len(args)):
+        if checkBan(args[i].lower()):
+            return
+        if args[i].isdigit(): #No digits allowed in aliases
+            toDelete.append(i)
+            continue
+        cur.execute("SELECT * FROM fullname WHERE name = ? AND server_id = ?", (args[i].lower(), message.channel.guild.id,))
+        check = cur.fetchone()
+        if check is not None:
+            if fullnameIndex == -1:
+                fullnameIndex = i
+            else:
+                #Multiple games with a full name
+                await message.channel.send("Multiple of the listed games have a fullname!")
+                return
+    
+    
+    if len(toDelete) > 0:
+        toDelete.reverse()
+        for i in range(len(toDelete)):
+            del args[i]
+            if fullnameIndex > i:
+                fullnameIndex -= 1
+    
+    if len(args) is None or len(args) == 0:
+        await message.channel.send(".alias <SHORT NAME>... <SHORT NAME> (abbreviation of the name of the game, without spaces)| One of the short names has to have a full name")
+        return
+        
+    if fullnameIndex == -1:
+        #No game has a full name
+        for arg in args:
+            cur.execute("DELETE FROM alias WHERE name = ? AND server_id = ?;", (arg.lower(), message.channel.guild.id,))
+        conn.commit()
+        await message.channel.send("Deleted aliases for " + ", ".join(args) + ".")
+        return
+    
+    if len(args) == 1:
+        #Has only name and it has a full name
+        await message.channel.send(".alias <SHORT NAME>...<SHORT NAME> (abbreviation of the name of the game, without spaces) | One of the short names has to have a full name")
+        return
+    
+    #Exactly one fullnamed game and at least 1 without one
+    aliases = []
+    for i in range(len(args)):
+        if i == fullnameIndex:
+            continue
+        cur.execute("SELECT * FROM alias WHERE name = ? AND server_id = ?;", (args[i].lower(), message.channel.guild.id,))    
+        alias = cur.fetchone()
+        aliases.append(args[i])
+        if alias is not None:
+            #Update instead of inserting if game has an alias already
+            cur.execute("UPDATE alias SET other_name = ? WHERE name = ? AND server_id = ?;", (args[fullnameIndex].lower(), args[i].lower(), message.channel.guild.id,))
+        else:
+            cur.execute("INSERT INTO alias (name, other_name, server_id) VALUES (?, ?, ?);", (args[i].lower(), args[fullnameIndex].lower(), message.channel.guild.id,))
+    await message.channel.send("Set the alias as \"" + args[fullnameIndex] + "\" for " + ", ".join(aliases) + ".")
+    conn.commit()
+#end
+        
+async def cmd_default(message : discord.Message, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM channel WHERE channel_id = ?", (message.channel.id,))
+    channel = cur.fetchone()
+    content = (' '.join(message.content.split())).split(" ")
+    args = content[1:len(content)]
+    
+    platformChanged = False
+    platform = PLATFORM_PC
+    gameChanged = False
+    game = ""
+    
+    if len(args) is None or len(args) == 0:
+        if channel is not None: #delete the default game for the channel
+            cur.execute("DELETE FROM channel WHERE channel_id = ?;", (message.channel.id,))
+            conn.commit();
+            await message.channel.send("Removed the default game for this channel.")
+        else:
+            await message.channel.send(".default <GAME> <PLATFORM>(pc(default)|psn|xbox)")
+        return
+    
+    for arg in args:
+        if arg.isdigit(): # arg is a time value, since it's the only digit we accept
+            continue
+        else:
+            if checkBan(arg.lower()):
+                return
+            if arg.lower() == PLATFORM_PC: # arg is a platform
+                platform = PLATFORM_PC
+                platformChanged = True
+            elif arg.lower() == PLATFORM_PSN or arg.lower() == "ps4" : # arg is a platform
+                platform = PLATFORM_PSN
+                platformChanged = True
+            elif arg.lower() == PLATFORM_XBOX : # arg is a platform
+                platform = PLATFORM_XBOX
+                platformChanged = True
+            elif game == "" and gameChanged == False: # arg is a game
+                game = arg.lower();
+                gameChanged = True
+    
+    if not gameChanged and not platformChanged:
+        await message.channel.send(".default <GAME> <PLATFORM>(pc(default)|psn|xbox)")
+        return
+    
+        
+    if channel is not None: #Change existing default parameters
+        if gameChanged:
+            cur.execute("UPDATE channel SET default_game = ? WHERE channel_id = ?;", (game, message.channel.id,))
+        if platformChanged:
+            cur.execute("UPDATE channel SET default_platform = ?WHERE channel_id = ?;", (platform, message.channel.id,)) 
+        await message.channel.send("Changed default parameters for the channel.")
+    elif game == "": #No default parameters, so we need a game
+        await message.channel.send(".default <TIME>(default 30 minutes) <GAME> <PLATFORM>(pc(default)|psn|xbox)")
+        return
+    else:
+        cur.execute("INSERT INTO channel (channel_id, default_game, default_platform) VALUES (?, ?, ?);",(message.channel.id, game, platform)) 
+        await message.channel.send("Gave the channel a default game.")
+    conn.commit()
+#end
+
+async def cmd_pinglist(message : discord.Message, conn):
+    content = (' '.join(message.content.split())).split(" ")
+    args = content[1:len(content)]
+    if len(args) is None or len(args) == 0:
+        await message.channel.send(".p <NAME> (Name of the pinglist. If one with that name exists, you subscribe to it. If not you create it. If you have created the list, you ping everyone on it.)")
+        return
+    for i in range(len(args)):
+        if checkBan(args[i].lower()):
+            return
+            
+    #Check if the name is already a list
+    arg = ' '.join(args)
+    
+    cur = conn.cursor()
+    cur.execute("SELECT discord_id FROM pinghost WHERE listname = ? AND server_id = ?", (arg.lower(), message.channel.guild.id,))
+    pinglist = cur.fetchone()
+    
+    #Check if the name is already a list
+    if pinglist is not None: #List exists already
+        if message.author.id == pinglist[0]: #Message author created the list
+            cur.execute("SELECT discord_id FROM pingsub WHERE listname = ? AND server_id = ?",(arg.lower(), message.channel.guild.id,))
+            subs = cur.fetchall()
+            ping = "Pinging for \"" + arg + "\" - "
+            for i in range(len(subs)):
+                ping += "<@{}>".format(subs[i][0])
+                if i < len(subs)-1:
+                    ping += ", "
+            
+            await message.channel.send(ping)
+            return
+        else: #Not the authors list
+            cur.execute("SELECT * FROM pingsub WHERE listname = ? AND server_id = ? AND discord_id = ?",(arg.lower(), message.channel.guild.id, message.author.id,))
+            pinglist = cur.fetchone()
+            if pinglist is None: #Not here, subscribe
+                cur.execute("INSERT INTO pingsub (listname, server_id, discord_id) VALUES (?, ?, ?);", (arg.lower(), message.channel.guild.id, message.author.id,))
+                conn.commit()
+                await message.channel.send("Subscribed for pinglist called \"" + arg + "\".")
+                return
+            else: #Already subscribe, remove
+                cur.execute("DELETE FROM pingsub WHERE listname = ? AND server_id = ? AND discord_id = ?;", (arg.lower(), message.channel.guild.id, message.author.id,))
+                conn.commit()
+                await message.channel.send("Removed subscription for pinglist called \"" + arg + "\".")
+                return
+    else: #No list, so create one
+        cur.execute("INSERT INTO pinghost (listname, server_id, discord_id) VALUES (?, ?, ?);", (arg.lower(), message.channel.guild.id, message.author.id,))
+        conn.commit()
+        await message.channel.send("Created pinglist called \"" + arg + "\".")
+#end
+
+async def cmd_pinglistclear(message : discord.Message, conn, admin):
+    content = (' '.join(message.content.split())).split(" ")
+    args = content[1:len(content)]
+    if len(args) is None or len(args) == 0:
+        await message.channel.send(".pc <NAME> (Name of the pinglist you want to delete. You have to be a moderator or have created the list to delete it")
+        return
+    for i in range(len(args)):
+        if checkBan(args[i].lower()):
+            return
+    
+    arg = ' '.join(args)
+    
+    cur = conn.cursor()
+    cur.execute("SELECT discord_id FROM pinghost WHERE listname = ? AND server_id = ?", (arg.lower(), message.channel.guild.id,))
+    pinglist = cur.fetchone()
+    
+    if pinglist is not None:
+        if pinglist[0] == message.author.id or admin:
+            cur.execute("DELETE FROM pinghost WHERE listname = ? AND server_id = ?", (arg.lower(), message.channel.guild.id,))
+            conn.commit()
+            await message.channel.send("Deleted a pinglist with the name \"" + arg + "\".")
+        else:
+            await message.channel.send("You do not have the permission to delete that list.")
+    else:
+        await message.channel.send("No pinglist with the name \"" + arg + "\".")
+#end
+
+async def cmd_board(message : discord.Message, conn):
+    cur = conn.cursor()
+    cur.execute("SELECT channel_id, message_id FROM board WHERE server_id = ?", (message.channel.guild.id,))
+    board = cur.fetchone()
+    
+    if board is not None: #server already has a board
+        if board[0] == message.channel.id: #The message was in the messageboard, so let's delete it
+            cur.execute("DELETE FROM board WHERE channel_id = ?;", (message.channel.id,))
+            dprint("Deleted board.")
+            conn.commit()
+        else: #Designate a new channel
+            cur.execute("UPDATE board SET channel_id = ? WHERE server_id = ?;", (message.channel.id, message.channel.guild.id))
+            conn.commit()
+            dprint("Update board.")
+            await updateBoard(message.channel.guild.id, conn, True) #Update the message into new channel, so we want to delete instead of update
+    else: #server has no board
+        cur.execute("INSERT INTO board(channel_id, server_id, message_id) VALUES (?,?,?);", (message.channel.id, message.channel.guild.id, -1,))
+        conn.commit()
+        dprint("New board.")
+        await updateBoard(message.channel.guild.id, conn, True) #Update the message into new channel, so we want to delete instead of update
 #end
 
 async def cmd_stats(message : discord.Message, conn):
@@ -235,6 +550,7 @@ async def cmd_lobby(message : discord.Message, conn):
 async def cmd_clearall(message : discord.Message, conn):
     deleteAllMatchesByUserId(message.author.id, conn)
     await message.channel.send(DEFAULT_CANCEL_MESSAGE.format("everything!"))
+    await updateBoard(message.guild.id, conn, False)
 
 async def cmd_list(message : discord.Message, conn):
     # Load all pending matches
@@ -275,20 +591,19 @@ async def cmd_matchmake(message : discord.Message, conn):
     cancelMessage = None
     platform = None
     gameList = []
-    banList = ["table", "tables", "drop", "insert", "insert", ";", "\\"]
+    cur = conn.cursor()
+    
     if len(args) > 0:
         for arg in args:
             if arg.isdigit(): # arg is a time value, since it's the only digit we accept
                 duration = int(arg)
-                if duration == 0:
+                if duration <= 0:
                     duration == 1
                 elif duration >= 1440:
                     duration = 1440
             else:
-                for word in banList:
-                    if word in arg.lower(): # what the fuck dude
-                        dprint("ban pls")
-                        return
+                if checkBan(arg.lower()):
+                    return
                 if arg.lower() == PLATFORM_PC: # arg is a platform
                     platform = PLATFORM_PC
                 elif arg.lower() == PLATFORM_PSN or arg.lower() == "ps4" : # arg is a platform
@@ -300,15 +615,15 @@ async def cmd_matchmake(message : discord.Message, conn):
                         await message.channel.send(USAGE_MESSAGE)
                         return
                     exists = False
+                    gameName = getAlias(arg.lower(), cur, message.channel.guild.id)
                     for game in gameList:
-                        if game.lower() == arg.lower():
+                        if game.lower() == gameName:
                             exists = True
                             break
                     if not exists:
-                        gameList.append(arg)
+                        gameList.append(gameName)
 
     # Is this channel actually registerd to work with the bot?
-    cur = conn.cursor()
     cur.execute("SELECT * FROM channel WHERE channel_id = ?", (message.channel.id,))
     channelInfo = cur.fetchone()
 
@@ -317,7 +632,7 @@ async def cmd_matchmake(message : discord.Message, conn):
     if channelInfo is not None: # Stop if not registered
         ch = Channel(int(channelInfo[0]), int(channelInfo[1]), channelInfo[2], channelInfo[3], channelInfo[4], channelInfo[5], channelInfo[6])
         if len(gameList) == 0:
-            gameList.append(ch.default_game)
+            gameList.append(getAlias(ch.default_game, cur, message.channel.guild.id))
         if platform is None:
             platform = ch.default_platform
         matchmakeMessage = ch.default_matchmake_message
@@ -332,7 +647,6 @@ async def cmd_matchmake(message : discord.Message, conn):
         matchMessage = DEFAULT_MATCH_MESSAGE
         matchmakeMessage = DEFAULT_MATCHMAKE_MESSAGE
         cancelMessage = DEFAULT_CANCEL_MESSAGE
-
 
     # Load all pending matches
     cur.execute("SELECT * FROM match")
@@ -382,17 +696,18 @@ async def cmd_matchmake(message : discord.Message, conn):
                         # We found a pending matchmaking request for the given game and platform in this channel!
                         cur = conn.cursor()
                         cur.execute("DELETE FROM match WHERE id = ?;", (match.id,))
+                        msg = matchMessage.format("<@{}>".format(match.discord_id), message.author.mention, getFullName(game, cur, message.channel.guild.id), platform.upper())
                         conn.commit()
-                        msg = matchMessage.format("<@{}>".format(match.discord_id), message.author.mention, game, platform.upper())
                         await message.channel.send(msg)
                         # Delete other pending match requests for both players
                         deleteAllMatchesByUserId(message.author.id, conn)
                         deleteAllMatchesByUserId(match.discord_id, conn)
+                        await updateBoard(message.channel.guild.id, conn, False)
                         return # We are done
                 elif match.game.lower() == game.lower() and match.platform.lower() == platform.lower():
                     # We found an old matchmaking request from this user in this channel. Cancel it.
                     deleteMatch(match, conn)
-                    canceledMatches.append(game) # For informing the user later below
+                    canceledMatches.append(getFullName(game, cur, message.channel.guild.id)) # For informing the user later below
                     newMatch = False
                     if len(matches) == 1 and (time.time() - 60) < match.timestamp:
                         dprint("memes")
@@ -401,11 +716,11 @@ async def cmd_matchmake(message : discord.Message, conn):
             # No existing matches that matter... has to be a new match then...
             if newMatch:
                 createNewMatch(game.lower(), platform.lower(), duration, message, channelInfo, serverId, conn)
-                createdMatches.append(game)
+                createdMatches.append(getFullName(game,cur, message.channel.guild.id))
     else: # There's no matches, so this has to be a new one
         for game in gameList:
             createNewMatch(game.lower(), platform.lower(), duration, message, channelInfo, serverId, conn)
-            createdMatches.append(game)
+            createdMatches.append(getFullName(game, cur, message.channel.guild.id))
 
     # We created a new match if we are here
     dprint("Deleted matches: " + ", ".join(canceledMatches))
@@ -419,8 +734,81 @@ async def cmd_matchmake(message : discord.Message, conn):
     dprint("Created matches: " + ", ".join(createdMatches))
     if len(createdMatches) > 0:
         await message.channel.send(matchmakeMessage.format(', '.join(createdMatches), platform.upper(), duration))
+    
+    await updateBoard(message.channel.guild.id, conn, len(createdMatches) > 0)
     return
 
+def checkBan(message):
+    for word in BANLIST:
+        if word in message.lower(): # what the fuck dude
+            dprint("ban pls")
+            return True
+    return False
+    
+def getAlias(game, cur, id):
+    game = game.lower() #we want to store stuff internally as lower case
+    cur.execute("SELECT other_name FROM alias WHERE name = ? AND server_id = ?", (game, id,))
+    alias = cur.fetchone()
+    if alias is not None:
+        dprint(alias[0]);
+        return alias[0];
+    return game
+
+def getFullName(game, cur, id):
+    cur.execute("SELECT other_name FROM fullname WHERE name = ? AND server_id = ?", (game.lower(), id,))
+    fullname = cur.fetchone()
+    if fullname is not None:
+        dprint(fullname[0]);
+        return fullname[0];
+    return game
+    
+async def updateBoard(server_id : int, conn, deleteInsteadOfUpdate : bool):
+    cur = conn.cursor()
+    cur.execute("SELECT channel_id, message_id FROM board WHERE server_id = ?;", (server_id,))
+    board = cur.fetchone()
+    
+    if board is not None:
+        channel = client.get_channel(board[0])
+        if channel is not None: 
+            cur.execute("SELECT * FROM match WHERE server_id = ?", (server_id,))
+            matches = cur.fetchall()
+            matches = check_match_expriration(matches, conn)
+
+            listMessage = "Pending searches:"
+            statusMessage = ""
+            game = ""
+            for m in matches:
+                match = Match(int(m[0]), int(m[1]), int(m[2]), m[3], int(m[4]), m[5], int(m[6]), int(m[7]))
+                game = match.game
+                statusMessage += " " + game
+                cur.execute("SELECT other_name FROM fullname WHERE name = ?", (match.game,))
+                fullname = cur.fetchone()
+                statusMessage += " " + game
+                if fullname is not None:
+                    game = fullname[0]
+                listMessage += "\n" + game + " on " + match.platform.upper() + " until " + time.strftime("%H.%M", time.localtime(match.expires_at))
+        
+            hasMessage = False
+            if statusMessage == "":
+                statusMessage = "None"
+            await client.change_presence(activity=discord.Game(statusMessage))
+            if board[1] >= 0: #-1 is no message yet, and fetch_message excepts a non-negative value
+                try:
+                    message = await channel.fetch_message(board[1])
+                    hasMessage = True
+                except discord.NotFound as e:
+                    dprint(str(e))
+            
+            if deleteInsteadOfUpdate or not hasMessage:
+                if hasMessage:
+                    await message.delete()
+                message = await channel.send(listMessage)
+                cur.execute("UPDATE board SET message_id = ? WHERE channel_id = ?;", (message.id, message.channel.id))
+                conn.commit()
+            else:
+                await message.edit(content=listMessage)
+#end
+    
 def deleteMatch(match, conn):
     dprint("Deleting match id=" + str(match.id))
     cur = conn.cursor()
@@ -499,6 +887,31 @@ async def on_ready():
         cur.execute(CREATE_TABLE_USER)
     except sqlite3.Error as e:
         dprint(str(e))
+        
+    try:
+        cur.execute(CREATE_TABLE_FULLNAME)
+    except sqlite3.Error as e:
+        dprint(str(e))
+    try:
+        cur.execute(CREATE_TABLE_ALIAS)
+    except sqlite3.Error as e:
+        dprint(str(e))
+    
+    try:
+        cur.execute(CREATE_TABLE_PINGHOST)
+    except sqlite3.Error as e:
+        dprint(str(e))
+        
+    try:
+        cur.execute(CREATE_TABLE_PINGSUB)
+    except sqlite3.Error as e:
+        dprint(str(e))
+    
+    try:
+        cur.execute(CREATE_TABLE_BOARD)
+    except sqlite3.Error as e:
+        dprint(str(e))
+        
     conn.close()
 
 async def task():
@@ -506,21 +919,6 @@ async def task():
 #    while True:
 #        await asyncio.sleep(1)
 #        print('Running')
-
-while True:
-    client.loop.create_task(task())
-    try:
-        client.loop.run_until_complete(client.start(TOKEN))
-    except SystemExit:
-        handle_exit()
-    except KeyboardInterrupt:
-        handle_exit()
-        client.loop.close()
-        print("Program ended")
-        break
-
-    print("Bot restarting")
-    client = discord.Client(loop=client.loop)
 
 def handle_exit():
     print("Handling")
@@ -539,3 +937,20 @@ def handle_exit():
             pass
         except asyncio.CancelledError:
             pass
+
+while True:
+    client.loop.create_task(task())
+    try:
+        client.loop.run_until_complete(client.start(TOKEN))
+    except SystemExit:
+        handle_exit()
+    except KeyboardInterrupt:
+        handle_exit()
+        client.loop.close()
+        print("Program ended")
+        break
+
+    print("Bot restarting")
+    client = discord.Client(loop=client.loop)
+
+
