@@ -55,6 +55,15 @@ CREATE_TABLE_MATCH = """CREATE TABLE match (id INTEGER PRIMARY KEY AUTOINCREMENT
     # platform = match[5]
     # server_id = match[6]
     # timestamp = match[7]
+CREATE_TABLE_BEGINNERMATCH = """CREATE TABLE beginnermatch (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER NOT NULL, discord_id INTEGER NOT NULL, game VARCHAR(100) NOT NULL, expiration INT NOT NULL, platform VARCHAR(5) DEFAULT "pc", server_id INTEGER NOT NULL, timestamp INTEGER);"""
+    # id = match[0]
+    # channel_id = match[1]
+    # discord_id = match[2]
+    # game = match[3]
+    # expires_at = match[4]
+    # platform = match[5]
+    # server_id = match[6]
+    # timestamp = match[7]
 CREATE_TABLE_CHANNEL = """CREATE TABLE channel (id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER NOT NULL UNIQUE, default_game varchar(100) NOT NULL, default_platform VARCHAR(5) DEFAULT "pc", default_matchmake_message VARCHAR(100) DEFAULT "Matchmaking for {0} on {1} for {2} minutes", default_match_message VARCHAR(100) DEFAULT "Match found! {0} vs {1} on {2} on {3}", default_cancel_message VARCHAR(100) DEFAULT "Canceled matchmaking for {0}");"""
     #  id = channel[0]
     #  channel_id = channel[1]
@@ -96,6 +105,7 @@ PLATFORM_PSN = "psn"
 PLATFORM_XBOX = "xbox"
 
 USAGE_MESSAGE = "Usage: .m <TIME>(default 30 minutes) <GAME> <PLATFORM>(pc|psn|xbox)"
+USAGE_MESSAGE_BEGINNER = "Usage: .n <TIME>(default 30 minutes) <GAME> <PLATFORM>(pc|psn|xbox)"
 # These are used when there's no registered channel found
 DEFAULT_MATCHMAKE_MESSAGE = "Matchmaking for {0} on {1} for {2} minutes"
 DEFAULT_MATCH_MESSAGE = "Match found! {0} vs {1} on {2} on {3}"
@@ -132,9 +142,9 @@ class User:
 @client.event
 async def on_message(message : discord.Message):
     msg = message.content
-    if msg.startswith(",m"):
+    if msg.startswith(",m") or msg.startswith(",n"):
         await message.add_reaction("<:muikea:296390386547556352>")
-    elif msg.startswith('.steamid') or msg.startswith(".lobby") or msg.startswith(".m") or msg.startswith(".fullname") or msg.startswith(".alias") or msg.startswith(".d") or msg.startswith(".p") or msg.startswith(".board"):
+    elif msg.startswith('.steamid') or msg.startswith(".lobby") or msg.startswith(".m") or msg.startswith(".fullname") or msg.startswith(".alias") or msg.startswith(".d") or msg.startswith(".p") or msg.startswith(".board") or msg.startswith(".n"):
         # We do not want the bot to reply to itself
         if message.author == client.user:
             return
@@ -158,13 +168,16 @@ async def on_message(message : discord.Message):
         elif msg.startswith('.lobby'):
             dprint(".lobby ; " + message.author.name + "-" + str(message.author.id))
             await cmd_lobby(message, conn)
-        elif msg.startswith('.ml') or msg.startswith('.m list'):
+        elif msg.startswith('.ml') or msg.startswith('.nl'):
             await cmd_list(message, conn)
-        elif msg.startswith('.mc') or msg.startswith('.m clear'):
+        elif msg.startswith('.mc') or msg.startswith('.nc'):
             await cmd_clearall(message, conn)
         elif msg.startswith('.m') and not directMessage:
             dprint(".m ; " + message.author.name + "-" + str(message.author.id))
-            await cmd_matchmake(message, conn)
+            await cmd_matchmake(message, False, conn)
+        elif msg.startswith('.n') and not directMessage:
+            dprint("n ; " + message.author.name + "-" + str(message.author.id))
+            await cmd_matchmake(message, True, conn)
         elif msg.startswith('.pc') and not directMessage:
             dprint(".pc ; " + message.author.name + "-" + str(message.author.id))
             await cmd_pinglistclear(message, conn, admin)
@@ -557,16 +570,20 @@ async def cmd_list(message : discord.Message, conn):
     cur = conn.cursor()
     cur.execute("SELECT * FROM match")
     matches = cur.fetchall()
-    matches = check_match_expriration(matches, conn)
+    matches = check_match_expiration(matches, "match", conn)
+    cur.execute("SELECT * FROM beginnermatch")
+    beginnerMatches = cur.fetchall()
+    beginnerMatches = check_match_expiration(beginnerMatches, "beginnermatch", conn)
 
     listMessage = "Pending searches:"
     for guild in client.guilds: # Get matches in just this server
+    
         guildName = None
-        if guild.get_member(message.author.id) == None:
+        if guild.get_member(message.author.id) == None and message.guild.id != guild.id:
             continue # Not a mutual guild
         else:
             guildName = guild.name
-
+        
         for m in matches:
             match = Match(int(m[0]), int(m[1]), int(m[2]), m[3], int(m[4]), m[5], int(m[6]), int(m[7]))
             if match.server_id == guild.id:
@@ -574,12 +591,25 @@ async def cmd_list(message : discord.Message, conn):
                     listMessage += "\n- " + guildName + " -"
                     guildName = None
                 listMessage += "\n" + match.game + " on " + match.platform
+        
+        for m in beginnerMatches:
+            match = Match(int(m[0]), int(m[1]), int(m[2]), m[3], int(m[4]), m[5], int(m[6]), int(m[7]))
+            if match.server_id == guild.id:
+                if guildName is not None:
+                    listMessage += "\n- " + guildName + " -"
+                    guildName = None
+                listMessage += "\n" + match.game + " (Beginner) on " + match.platform
     #end loops
     await message.author.send(listMessage)
 
-async def cmd_matchmake(message : discord.Message, conn):
+async def cmd_matchmake(message : discord.Message, beginner, conn):
     global DEFAULT_MATCHMAKING_EXPIRATION
     global SECONDS
+    
+    table = "match"
+    
+    if beginner:
+        table = "beginnermatch"
 
     # Handle the user input
     args = (' '.join(message.content.split())).split(" ")
@@ -612,7 +642,10 @@ async def cmd_matchmake(message : discord.Message, conn):
                     platform = PLATFORM_XBOX
                 else: # arg is a game
                     if arg.lower() == "h" or arg.lower() == "help":
-                        await message.channel.send(USAGE_MESSAGE)
+                        if beginner:
+                            await message.channel.send(USAGE_MESSAGE_BEGINNER)
+                        else:
+                            await message.channel.send(USAGE_MESSAGE)
                         return
                     exists = False
                     gameName = getAlias(arg.lower(), cur, message.channel.guild.id)
@@ -640,7 +673,10 @@ async def cmd_matchmake(message : discord.Message, conn):
         cancelMessage = ch.default_cancel_message
     else:
         if len(gameList) == 0:
-            await message.channel.send(USAGE_MESSAGE)
+            if beginner:
+                await message.channel.send(USAGE_MESSAGE_BEGINNER)
+            else:
+                await message.channel.send(USAGE_MESSAGE)
             return
         if platform is None: # Lets just assume it's PC on non-registered channels
             platform = PLATFORM_PC
@@ -649,10 +685,10 @@ async def cmd_matchmake(message : discord.Message, conn):
         cancelMessage = DEFAULT_CANCEL_MESSAGE
 
     # Load all pending matches
-    cur.execute("SELECT * FROM match")
+    cur.execute("SELECT * FROM " + table)
     matches = cur.fetchall()
 
-    matches = check_match_expriration(matches, conn)
+    matches = check_match_expiration(matches, table, conn)
 
     serverId = None
     for guild in client.guilds: # Check if the match request is in this server
@@ -695,8 +731,8 @@ async def cmd_matchmake(message : discord.Message, conn):
                         dprint("Match made successfully!")
                         # We found a pending matchmaking request for the given game and platform in this channel!
                         cur = conn.cursor()
-                        cur.execute("DELETE FROM match WHERE id = ?;", (match.id,))
-                        msg = matchMessage.format("<@{}>".format(match.discord_id), message.author.mention, getFullName(game, cur, message.channel.guild.id), platform.upper())
+                        cur.execute("DELETE FROM " + table + " WHERE id = ?;", (match.id,))
+                        msg = matchMessage.format("<@{}>".format(match.discord_id), message.author.mention, getFullName(game, beginner, cur, message.channel.guild.id), platform.upper())
                         conn.commit()
                         await message.channel.send(msg)
                         # Delete other pending match requests for both players
@@ -706,8 +742,8 @@ async def cmd_matchmake(message : discord.Message, conn):
                         return # We are done
                 elif match.game.lower() == game.lower() and match.platform.lower() == platform.lower():
                     # We found an old matchmaking request from this user in this channel. Cancel it.
-                    deleteMatch(match, conn)
-                    canceledMatches.append(getFullName(game, cur, message.channel.guild.id)) # For informing the user later below
+                    deleteMatch(match, table, conn)
+                    canceledMatches.append(getFullName(game, beginner, cur, message.channel.guild.id)) # For informing the user later below
                     newMatch = False
                     if len(matches) == 1 and (time.time() - 60) < match.timestamp:
                         dprint("memes")
@@ -715,12 +751,12 @@ async def cmd_matchmake(message : discord.Message, conn):
                     break
             # No existing matches that matter... has to be a new match then...
             if newMatch:
-                createNewMatch(game.lower(), platform.lower(), duration, message, channelInfo, serverId, conn)
-                createdMatches.append(getFullName(game,cur, message.channel.guild.id))
+                createNewMatch(game.lower(), platform.lower(), duration, message, channelInfo, serverId, table, conn)
+                createdMatches.append(getFullName(game, beginner, cur, message.channel.guild.id))
     else: # There's no matches, so this has to be a new one
         for game in gameList:
-            createNewMatch(game.lower(), platform.lower(), duration, message, channelInfo, serverId, conn)
-            createdMatches.append(getFullName(game, cur, message.channel.guild.id))
+            createNewMatch(game.lower(), platform.lower(), duration, message, channelInfo, serverId, table, conn)
+            createdMatches.append(getFullName(game, beginner, cur, message.channel.guild.id))
 
     # We created a new match if we are here
     dprint("Deleted matches: " + ", ".join(canceledMatches))
@@ -750,17 +786,20 @@ def getAlias(game, cur, id):
     cur.execute("SELECT other_name FROM alias WHERE name = ? AND server_id = ?", (game, id,))
     alias = cur.fetchone()
     if alias is not None:
-        dprint(alias[0]);
-        return alias[0];
+        dprint(alias[0])
+        return alias[0]
     return game
 
-def getFullName(game, cur, id):
+def getFullName(game, beginner, cur, id):
     cur.execute("SELECT other_name FROM fullname WHERE name = ? AND server_id = ?", (game.lower(), id,))
+    name = game
     fullname = cur.fetchone()
     if fullname is not None:
-        dprint(fullname[0]);
-        return fullname[0];
-    return game
+        dprint(fullname[0])
+        name = fullname[0]
+    if beginner:
+        name += " (Beginner)"
+    return name
     
 async def updateBoard(server_id : int, conn, deleteInsteadOfUpdate : bool):
     cur = conn.cursor()
@@ -772,20 +811,39 @@ async def updateBoard(server_id : int, conn, deleteInsteadOfUpdate : bool):
         if channel is not None: 
             cur.execute("SELECT * FROM match WHERE server_id = ?", (server_id,))
             matches = cur.fetchall()
-            matches = check_match_expriration(matches, conn)
+            matches = check_match_expiration(matches, "match", conn)
 
-            listMessage = "Pending searches:"
+            listMessage = "No searches."
             statusMessage = ""
             game = ""
+            
+            if len(matches) > 0:
+                listMessage = "Pending searches (.m):"
+            
             for m in matches:
                 match = Match(int(m[0]), int(m[1]), int(m[2]), m[3], int(m[4]), m[5], int(m[6]), int(m[7]))
                 game = match.game
                 statusMessage += " " + game
-                cur.execute("SELECT other_name FROM fullname WHERE name = ?", (match.game,))
-                fullname = cur.fetchone()
+                game = getFullName(game, False, cur, server_id)
+                listMessage += "\n" + game + " on " + match.platform.upper() + " until " + time.strftime("%H.%M", time.localtime(match.expires_at))
+            
+            
+            cur.execute("SELECT * FROM beginnermatch WHERE server_id = ?", (server_id,))
+            beginnerMatches = cur.fetchall()
+            beginnerMatches = check_match_expiration(beginnerMatches, "beginnermatch", conn)
+            
+            if len(beginnerMatches) > 0:
+                if len(matches) == 0:
+                    listMessage = "";
+                else:
+                    listMessage += "\n\n"
+                listMessage += "Pending searches for beginners (.n):"
+            
+            for m in beginnerMatches:
+                match = Match(int(m[0]), int(m[1]), int(m[2]), m[3], int(m[4]), m[5], int(m[6]), int(m[7]))
+                game = match.game
                 statusMessage += " " + game
-                if fullname is not None:
-                    game = fullname[0]
+                game = getFullName(game, True, cur, server_id)
                 listMessage += "\n" + game + " on " + match.platform.upper() + " until " + time.strftime("%H.%M", time.localtime(match.expires_at))
         
             hasMessage = False
@@ -809,33 +867,34 @@ async def updateBoard(server_id : int, conn, deleteInsteadOfUpdate : bool):
                 await message.edit(content=listMessage)
 #end
     
-def deleteMatch(match, conn):
+def deleteMatch(match, table, conn):
     dprint("Deleting match id=" + str(match.id))
     cur = conn.cursor()
-    cur.execute("DELETE FROM match WHERE id = ?;", (match.id,))
+    cur.execute("DELETE FROM " + table + " WHERE id = ?;", (match.id,))
     conn.commit()
 
 def deleteAllMatchesByUserId(discord_id, conn):
     dprint("Deleting all matches from user discord_id=" + str(discord_id))
     cur = conn.cursor()
     cur.execute("DELETE FROM match WHERE discord_id = ?;", (discord_id,))
+    cur.execute("DELETE FROM beginnermatch WHERE discord_id = ?;", (discord_id,))
     conn.commit()
 
-def createNewMatch(game, platform, duration, message, channelInfo, server_id, conn):
+def createNewMatch(game, platform, duration, message, channelInfo, server_id, table, conn):
     dprint("Creating a new match!!!")
     expiration = math.ceil(time.time() + duration * SECONDS)
     cur = conn.cursor() # Now create a new match
     dprint("channel_id=" + str(message.channel.id) + ", discord_id=" + str(message.author.id) + ", game=" + game + ", expiration=" + str(expiration) + ", platform=" + platform + ", server_id=" + str(server_id))
-    cur.execute("INSERT INTO match (channel_id, discord_id, game, expiration, platform, server_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?);", 
+    cur.execute("INSERT INTO " + table + " (channel_id, discord_id, game, expiration, platform, server_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?);", 
         (message.channel.id, message.author.id, game, expiration, platform, server_id, math.ceil(time.time())))
     conn.commit()
 
     dprint("Match created!!! " + str(cur.lastrowid))
 
 # Removes orphaned matches
-def check_match_expriration(matches, conn):
+def check_match_expiration(matches, table, conn):
     dprint("Cleaning expired matches...")
-    deleteSql = "DELETE FROM match WHERE id IN ({})"
+    deleteSql = "DELETE FROM " + table + " WHERE id IN ({})"
     returnMatchList = []
     idList = []
     for match in matches:
@@ -877,6 +936,11 @@ async def on_ready():
         cur.execute(CREATE_TABLE_MATCH)
     except sqlite3.Error as e:
         dprint(str(e))
+    try:
+        cur.execute(CREATE_TABLE_BEGINNERMATCH)
+    except sqlite3.Error as e:
+        dprint(str(e))
+    
 
     try:
         cur.execute(CREATE_TABLE_CHANNEL)
